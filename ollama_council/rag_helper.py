@@ -1,3 +1,5 @@
+# rag_helper.py
+
 #!/usr/bin/env python3
 """
 rag_helper.py
@@ -5,11 +7,6 @@ rag_helper.py
 RAG helper using:
   - SQLite DB: ./filebase.sqlite
   - Ollama embeddings (nomic-embed-text)
-  - NumPy cosine similarity
-
-Provides:
-    - get_context(question, k=6) -> str
-    - ask_with_filebase(question) -> str
 """
 
 import os
@@ -20,12 +17,11 @@ import textwrap
 import numpy as np
 import requests
 
-DB_PATH = "/home/landon/Documents/Code-Repos/ollama_council/filebase.sqlite"
+DB_PATH = "./filebase.sqlite"
 EMBED_MODEL = "nomic-embed-text"
-CHAT_MODEL = "llama3"
+CHAT_MODEL = "llama3" # Not used by RAG directly, but helpful for reference
 
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
-
 
 # -----------------------------
 # EMBEDDINGS
@@ -40,7 +36,6 @@ def get_embedding(text: str):
     )
     resp.raise_for_status()
     data = resp.json()
-
     return np.array(data["embedding"], dtype=np.float32)
 
 
@@ -58,17 +53,6 @@ def get_connection():
 
 
 def load_all_chunks(conn: sqlite3.Connection):
-    """
-    Load all chunks from the database.
-
-    Returns list of dicts:
-    {
-        "path": str,
-        "chunk_index": int,
-        "content": str,
-        "embedding": np.ndarray
-    }
-    """
     cur = conn.cursor()
     cur.execute("SELECT path, chunk_index, content, embedding FROM chunks")
     rows = cur.fetchall()
@@ -87,7 +71,6 @@ def load_all_chunks(conn: sqlite3.Connection):
             "content": content,
             "embedding": emb_vec
         })
-
     return chunks
 
 
@@ -96,10 +79,7 @@ def load_all_chunks(conn: sqlite3.Connection):
 # -----------------------------
 
 def cosine_similarity(query_vec: np.ndarray, doc_vecs: np.ndarray):
-    """
-    Compute cosine similarity between query_vec (d,)
-    and doc_vecs (n, d).
-    """
+    """Compute cosine similarity."""
     q_norm = np.linalg.norm(query_vec)
     d_norms = np.linalg.norm(doc_vecs, axis=1)
 
@@ -109,26 +89,31 @@ def cosine_similarity(query_vec: np.ndarray, doc_vecs: np.ndarray):
     sims = np.zeros_like(d_norms)
     valid = d_norms > 0
     sims[valid] = (doc_vecs[valid] @ query_vec) / (d_norms[valid] * q_norm)
-
     return sims
 
 
 # -----------------------------
-# RAG RETRIEVAL
+# RAG RETRIEVAL (k reduced to 3)
 # -----------------------------
 
-def get_context(question: str, k: int = 6) -> str:
+def get_context(question: str, k: int = 3) -> str:
     """
     Search the vector DB and return the top-k chunks as a formatted context string.
+    k is reduced to 3 to minimize prompt length and improve agent compliance.
     """
     conn = get_connection()
     chunks = load_all_chunks(conn)
     conn.close()
 
     if not chunks:
-        return "No chunks indexed. Run file_indexing.py first."
+        return "No code context available."
 
-    q_vec = get_embedding(question)
+    try:
+        q_vec = get_embedding(question)
+    except Exception as e:
+        print(f"Embedding failed: {e}", file=sys.stderr)
+        return "Embedding service unavailable."
+
 
     doc_vecs = np.stack([c["embedding"] for c in chunks], axis=0)
     sims = cosine_similarity(q_vec, doc_vecs)
@@ -143,50 +128,10 @@ def get_context(question: str, k: int = 6) -> str:
 
         parts.append(
             textwrap.dedent(f"""
-            File: {c['path']} (chunk {c['chunk_index']})  [score={similarity:.3f}]
+            File: {c['path']} (chunk {c['chunk_index']}) [score={similarity:.3f}]
             --------------------------------------------------
             {c['content']}
             """).strip()
         )
 
     return "\n\n==================================================\n\n".join(parts)
-
-
-# -----------------------------
-# OPTIONAL DIRECT QA
-# -----------------------------
-
-def ask_with_filebase(question: str) -> str:
-    """
-    Send question + retrieved context directly to Ollama using /api/generate.
-    """
-    context = get_context(question)
-
-    prompt = textwrap.dedent(f"""
-    You are a software assistant with access to a local filebase.
-
-    Use the context below to answer the question.
-    If something is not in the context, say so.
-
-    === CONTEXT START ===
-    {context}
-    === CONTEXT END ===
-
-    Question: {question}
-    """)
-
-    resp = requests.post(
-        f"{OLLAMA_URL}/api/generate",
-        json={
-            "model": CHAT_MODEL,
-            "prompt": prompt,
-            "stream": False,
-        },
-        timeout=600,
-    )
-    resp.raise_for_status()
-    data = resp.json()
-
-    # /api/generate returns: { "response": "...", ... }
-    return data["response"]
-

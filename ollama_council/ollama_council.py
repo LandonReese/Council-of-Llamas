@@ -2,20 +2,19 @@
 """
 ollama_council.py
 
-Multi-agent "council" wrapper for Ollama with filebase-aware RAG.
+Simplified Multi-agent "council" wrapper for Ollama with optional filebase-aware RAG.
+Refactored for two-stage deliberation (Respond -> Review -> Vote).
 
-Architecture:
-  - OllamaClient: thin HTTP client for Ollama /api/chat
-  - AgentResult: dataclass for each agent's output
-  - CouncilCoordinator: high-level orchestrator that:
-      * fetches RAG context
-      * runs agents in parallel
-      * collects votes
-      * resolves ties with a judge model
-  - main(): thin CLI wrapper around CouncilCoordinator
+Default behavior:
+  - NO RAG (no local filebase reads) unless explicitly enabled.
 
-Usage:
-    python ollama_council.py "Your question about the project"
+Usage examples:
+
+  # Models only (no local filebase context)
+  council "Explain nuclear fusion"
+
+  # Use local filebase RAG context (SQLite + embeddings)
+  council --context "Explain the architecture of this project"
 """
 
 from __future__ import annotations
@@ -31,7 +30,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 from tqdm import tqdm
 
-from agents import AGENTS, AGENT_MODEL, JUDGE_MODEL
+# NOTE: The user must ensure 'agents.py' and 'rag_helper.py' exist and are correct.
+from agents import AGENTS, JUDGE_MODEL
 from rag_helper import get_context
 
 
@@ -40,38 +40,69 @@ from rag_helper import get_context
 # -----------------------------
 
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
-MAX_WORKERS = 5  # how many agents to run in parallel
+MAX_WORKERS = 5  # Should match the number of agents defined in agents.py
 REQUEST_TIMEOUT = 600
 
 
 # -----------------------------
-# AGENT RULES
+# AGENT RULES (Two-Stage Prompts)
 # -----------------------------
 
-GLOBAL_AGENT_RULES = """
-You are one of several agents in a council. You must follow these universal rules:
+def get_agent_response_prompt(agent_name: str, agent_sys_prompt: str) -> str:
+    """
+    Stage 1 System Prompt: Builds the system prompt for the initial, non-voting 
+    response generation.
+    """
+    return textwrap.dedent(f"""
+        You are the {agent_name} agent. Your core instructions are: "{agent_sys_prompt}"
 
-1. You MUST answer the user's prompt directly, from your own perspective.
-2. You MUST stay fully in your own persona and style.
-3. You MUST NOT talk about other agents, critique them, or reference their existence.
-4. You MUST output ONLY a valid JSON object with exactly these keys:
-   - "response": your answer to the user, as a string.
-   - "vote": the NAME (string) of ONE other agent that you expect will provide
-             the most correct or helpful answer, based on your perspective.
+        --- MANDATORY RESPONSE FORMATTING ---
 
-5. The ONLY thing in your final message must be the JSON object.
-   - No commentary before or after.
-   - No markdown.
-   - No extra fields.
-   - No trailing commas.
-   - No explanations outside the JSON.
+        1. You MUST output ONLY a single, valid JSON object.
+        2. DO NOT include ANY commentary, NO markdown fences (```json), and NO text before or after the JSON.
+        3. The JSON MUST have exactly one key: "response", containing your detailed answer to the user's request.
 
-Valid example output:
-{
-  "response": "Your full answer goes here.",
-  "vote": "Engineer"
-}
-"""
+        Example: {{"response": "My answer here."}}
+    """).strip()
+
+
+def get_agent_deliberation_prompt(agent_name: str, agent_sys_prompt: str, valid_votes: List[str]) -> str:
+    """
+    Stage 2 System Prompt: Builds the system prompt for the deliberation and voting phase.
+    """
+    valid_votes_list = ", ".join(sorted(valid_votes))
+
+    return textwrap.dedent(f"""
+        You are the {agent_name} agent. Your core instructions are: "{agent_sys_prompt}"
+
+        Your task is to review the 'CANDIDATE RESPONSES' provided below, considering the 'USER REQUEST' and 'CONTEXT'.
+
+        --- MANDATORY RESPONSE FORMATTING ---
+
+        1. You MUST output ONLY a single, valid JSON object.
+        2. DO NOT include ANY commentary, NO markdown fences (```json), and NO text before or after the JSON.
+        3. The JSON MUST have exactly these two keys:
+           - "reasoning": A brief explanation of why you chose your vote.
+           - "vote": The NAME of the single agent you predict has the best answer.
+
+        4. Your vote MUST be the **EXACT** name (case-sensitive) of ONE agent from this list:
+           [{valid_votes_list}]
+        5. You CANNOT vote for yourself.
+        
+        Example: {{"reasoning": "The explanation here.", "vote": "{valid_votes[0] if valid_votes else 'N/A'}"}}
+    """).strip()
+
+
+# -----------------------------
+# DATA MODEL
+# -----------------------------
+
+@dataclass
+class AgentResult:
+    """Holds a single agent's result."""
+    name: str
+    response: str
+    vote: Optional[str]
 
 
 # -----------------------------
@@ -79,10 +110,7 @@ Valid example output:
 # -----------------------------
 
 class OllamaClient:
-    """
-    Thin wrapper around Ollama's /api/chat endpoint.
-    """
-
+    """Thin wrapper around Ollama's /api/chat endpoint."""
     def __init__(self, base_url: str = OLLAMA_URL, timeout: int = REQUEST_TIMEOUT) -> None:
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
@@ -91,21 +119,13 @@ class OllamaClient:
         self,
         model: str,
         messages: List[Dict[str, str]],
-        *,
-        stream: bool = False,
-        json_mode: bool = False,
+        json_mode: bool = True,  # Default to JSON mode for agents
     ) -> Dict[str, Any]:
-        """
-        Call /api/chat on the Ollama server.
-
-        If json_mode=True, we request structured JSON output via "format": "json".
-        """
         payload: Dict[str, Any] = {
             "model": model,
             "messages": messages,
-            "stream": stream,
+            "stream": False,
         }
-
         if json_mode:
             payload["format"] = "json"
 
@@ -119,9 +139,6 @@ class OllamaClient:
 
     @staticmethod
     def get_content(response: Dict[str, Any]) -> str:
-        """
-        Extract assistant content from the /api/chat response.
-        """
         try:
             return response["message"]["content"]
         except KeyError:
@@ -129,41 +146,11 @@ class OllamaClient:
 
 
 # -----------------------------
-# DATA MODEL
-# -----------------------------
-
-@dataclass
-class AgentResult:
-    """
-    Holds a single agent's result.
-
-    - name: agent name (e.g., "Detective")
-    - description: short description from agents.py
-    - response: natural language answer from that agent
-    - vote: name of the agent this one voted for (or None if invalid)
-    """
-    name: str
-    description: str
-    response: str
-    vote: Optional[str]
-
-
-# -----------------------------
 # COUNCIL COORDINATOR
 # -----------------------------
 
 class CouncilCoordinator:
-    """
-    High-level orchestrator for the multi-agent council.
-
-    Responsibilities:
-      - Retrieve RAG context
-      - Build prompts per agent
-      - Run agents in parallel
-      - Tally votes and resolve ties (if any)
-      - Return the final combined answer as a string
-    """
-
+    """High-level orchestrator for the multi-agent council."""
     def __init__(
         self,
         client: Optional[OllamaClient] = None,
@@ -173,263 +160,209 @@ class CouncilCoordinator:
         self.client = client or OllamaClient()
         self.agents = agents or AGENTS
         self.max_workers = min(max_workers, len(self.agents)) if self.agents else 1
+        self.all_agent_names = [a["name"] for a in self.agents]
+        # Store agent definitions by name for easy lookup
+        self.agent_defs_by_name = {a['name']: a for a in self.agents}
 
-    # ---------- Public API ----------
+    # ---------- Stage 1: Response Generation ----------
 
-    def ask(self, user_prompt: str) -> str:
-        """
-        Main pipeline:
-          1. Get RAG context
-          2. Run agents in parallel
-          3. Tally votes
-          4. Return winner's response (or all responses if no valid votes)
-        """
-        # 1) Retrieve filebase context
-        context = self._get_context_with_progress(user_prompt)
-
-        # 2) Run all agents in parallel
-        results = self._run_agents_with_progress(user_prompt, context)
-
-        if not results:
-            raise RuntimeError("No agent outputs produced. Check council logs.")
-
-        # 3) Tally votes
-        print("[*] Tallying votes...", file=sys.stderr)
-        tally = self._tally_votes(results)
-
-        # If no valid votes, fall back to printing all responses
-        if not tally:
-            print("[!] No valid votes were cast. Returning all agent responses.\n", file=sys.stderr)
-            return self._format_all_responses(results)
-
-        winners, max_votes = self._choose_winner_from_tally(tally)
-        result_by_name = {r.name: r for r in results}
-
-        # 4) Determine winner or run tie-breaker
-        if len(winners) == 1:
-            winner_name = winners[0]
-            winner_result = result_by_name[winner_name]
-            print(f"[+] Winner by majority vote: {winner_name} ({max_votes} votes)", file=sys.stderr)
-            return self._format_majority_winner(winner_name, winner_result)
-        else:
-            print(f"[*] Tie detected ({max_votes} votes each) for: {', '.join(winners)}", file=sys.stderr)
-            print("[*] Running impartial tie-breaker...", file=sys.stderr)
-
-            tied_results = [result_by_name[name] for name in winners]
-            winner_name, reasoning = self._run_tie_breaker_with_progress(
-                user_prompt, context, tied_results
-            )
-            print(f"[+] Tie resolved. Winner: {winner_name}", file=sys.stderr)
-            print(f"[+] Tie-breaker reasoning: {reasoning}", file=sys.stderr)
-
-            winning_result = result_by_name.get(winner_name, tied_results[0])
-            return self._format_tie_winner(winner_name, winning_result, reasoning)
-
-    def run_cli(self, argv: Optional[List[str]] = None) -> None:
-        """
-        Thin CLI wrapper: parse args, run ask(), print final answer to stdout.
-        """
-        if argv is None:
-            argv = sys.argv[1:]
-
-        if not argv:
-            print("Usage: python ollama_council.py \"Your question about the project\"", file=sys.stderr)
-            sys.exit(1)
-
-        user_prompt = " ".join(argv).strip()
-        answer = self.ask(user_prompt)
-        print(answer)
-
-    # ---------- RAG / Context ----------
-
-    def _get_context_with_progress(self, user_prompt: str) -> str:
-        """
-        Fetch RAG context with a small progress bar.
-        """
-        print("[*] Retrieving filebase context via RAG...", file=sys.stderr)
-        with tqdm(
-            total=1,
-            desc="RAG Context",
-            unit="step",
-            file=sys.stderr,
-            leave=False,
-        ) as pbar:
-            context = get_context(user_prompt)
-            pbar.update(1)
-        return context
-
-    # ---------- Agent Prompt Building ----------
-
-    def _build_agent_user_content(
+    def _run_single_response(
         self,
         agent: Dict[str, Any],
         user_prompt: str,
         context: str,
-    ) -> str:
+    ) -> AgentResult:
         """
-        Combine user question + RAG context into a user message tailored to an agent.
+        Stage 1 Execution: Runs an agent to generate its response (no voting).
         """
-        return textwrap.dedent(f"""
-            You are the {agent['name']} agent.
+        # 1. Build System Message (Persona + Mandatory Rules - NO VOTE)
+        system_content = get_agent_response_prompt(
+            agent["name"],
+            agent["system_prompt"],
+        )
 
-            Below is relevant context from the project's filebase. Use it as your primary source
-            when analyzing or answering. If something is not covered by the context,
-            say that clearly instead of hallucinating.
-
-            === FILEBASE CONTEXT START ===
+        # 2. Build User Message (Context + Question)
+        user_content = textwrap.dedent(f"""
+            === FILEBASE CONTEXT START (Top 3 Chunks) ===
             {context}
             === FILEBASE CONTEXT END ===
 
-            User request:
-            {user_prompt}
+            Your task is to answer the user's request using the context if it is helpful.
+            If the context is irrelevant or explicitly states that RAG is disabled,
+            rely on your own knowledge and persona instead.
 
-            As the {agent['name']} agent, focus specifically on your specialization/persona:
-            {agent['description']}
-
-            Provide a concise but detailed answer.
+            User Request: {user_prompt}
         """).strip()
 
-    def _build_agent_messages(
-        self,
-        agent: Dict[str, Any],
-        user_prompt: str,
-        context: str,
-        other_agent_names: List[str],
-    ) -> List[Dict[str, str]]:
-        """
-        Build /api/chat messages for a single agent, using a global ruleset
-        plus the agent's own persona prompt.
-        """
-        agent_user_content = self._build_agent_user_content(agent, user_prompt, context)
-        valid_votes_list = ", ".join(sorted(n for n in other_agent_names if n != agent["name"]))
-
-        json_instruction = textwrap.dedent(f"""
-            Remember:
-            - In the "vote" field of your JSON, you MUST choose exactly ONE of these agents:
-              [{valid_votes_list}]
-            - You CANNOT vote for yourself.
-        """).strip()
-
-        return [
-            {
-                "role": "system",
-                "content": GLOBAL_AGENT_RULES,
-            },
-            {
-                "role": "system",
-                "content": agent["system_prompt"],
-            },
-            {
-                "role": "user",
-                "content": agent_user_content + "\n\n" + json_instruction,
-            },
+        messages = [
+            {"role": "system", "content": system_content},
+            {"role": "user", "content": user_content},
         ]
 
-    # ---------- Agent Execution ----------
-
-    def _run_single_agent(
-        self,
-        agent: Dict[str, Any],
-        user_prompt: str,
-        context: str,
-        all_agent_names: List[str],
-    ) -> AgentResult:
-        """
-        Run a single agent and parse its JSON {response, vote}.
-        """
-        other_agent_names = [n for n in all_agent_names if n != agent["name"]]
-        messages = self._build_agent_messages(agent, user_prompt, context, other_agent_names)
-
+        # 3. Execute
         try:
-            resp = self.client.chat(AGENT_MODEL, messages, json_mode=True)
+            resp = self.client.chat(agent["model"], messages)
             content = self.client.get_content(resp)
-
-            # In json_mode, the assistant content should be JSON text.
             parsed = json.loads(content)
 
             response_text = str(parsed.get("response", "")).strip()
-            vote = parsed.get("vote")
-
-            if vote not in other_agent_names:
-                # Invalid vote target; ignore it.
-                print(f"[!] {agent['name']} produced invalid vote '{vote}'. Ignoring.", file=sys.stderr)
-                vote = None
 
             if not response_text:
-                response_text = (
-                    f"Error: agent {agent['name']} produced empty 'response'. "
-                    f"Raw JSON: {parsed!r}"
-                )
+                response_text = f"Error: {agent['name']} failed to generate a response."
 
             return AgentResult(
                 name=agent["name"],
-                description=agent["description"],
                 response=response_text,
-                vote=vote,
+                vote=None,  # Vote is always None in Stage 1
             )
 
         except Exception as e:
-            # Preserve failure, but still return an AgentResult so the council can proceed.
-            print(f"[!] {agent['name']} execution failed: {e}", file=sys.stderr)
+            print(f"[!] {agent['name']} execution failed (JSON/Ollama error): {e}", file=sys.stderr)
             return AgentResult(
                 name=agent["name"],
-                description=agent["description"],
-                response=f"Error during agent execution: {e}",
+                response=f"Error during execution: {e}",
                 vote=None,
             )
 
-    def _run_agents_with_progress(
-        self,
-        user_prompt: str,
-        context: str,
-    ) -> List[AgentResult]:
-        """
-        Run all agents in parallel with a progress bar.
-        """
-        print("[*] Running agents...", file=sys.stderr)
-        if not self.agents:
-            print("[!] No agents configured.", file=sys.stderr)
-            return []
-
-        agent_names = [a["name"] for a in self.agents]
+    def _run_response_generation(self, user_prompt: str, context: str) -> List[AgentResult]:
+        """Orchestrates parallel execution of Stage 1."""
+        print("[*] Stage 1: Running agents to generate responses...", file=sys.stderr)
         results: List[AgentResult] = []
 
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
             future_to_agent = {
-                executor.submit(
-                    self._run_single_agent,
-                    agent,
-                    user_prompt,
-                    context,
-                    agent_names,
-                ): agent
+                executor.submit(self._run_single_response, agent, user_prompt, context): agent
                 for agent in self.agents
             }
 
             with tqdm(
                 total=len(future_to_agent),
-                desc="Agents",
+                desc="Responses",
                 unit="agent",
                 file=sys.stderr,
             ) as pbar:
                 for future in as_completed(future_to_agent):
                     agent = future_to_agent[future]
                     try:
-                        result = future.result()
-                        results.append(result)
+                        results.append(future.result())
                     except Exception as e:
                         print(f"[!] {agent['name']} agent crashed: {e}", file=sys.stderr)
                     finally:
                         pbar.update(1)
-
         return results
+
+    # ---------- Stage 2: Deliberation and Voting ----------
+
+    def _run_single_deliberator(
+        self,
+        agent: Dict[str, Any],
+        user_prompt: str,
+        context: str,
+        candidate_responses: str,
+    ) -> Tuple[str, Optional[str]]:
+        """
+        Stage 2 Execution: Runs an agent to review candidate responses and cast a vote.
+        Returns (agent_name, vote_target).
+        """
+        other_agent_names = [n for n in self.all_agent_names if n != agent["name"]]
+
+        # 1. Build System Message (Persona + Mandatory Rules - WITH VOTE)
+        system_content = get_agent_deliberation_prompt(
+            agent["name"],
+            agent["system_prompt"],
+            other_agent_names,
+        )
+
+        # 2. Build User Message (Context + Question + ALL CANDIDATES)
+        user_content = textwrap.dedent(f"""
+            The original user request: "{user_prompt}"
+
+            === FILEBASE CONTEXT START (Top 3 Chunks) ===
+            {context}
+            === FILEBASE CONTEXT END ===
+
+            Review the candidate responses below and select the single best answer
+            based on correctness, clarity, and completeness. If the context indicates
+            RAG is disabled, rely on your own knowledge and the responses themselves.
+
+            === CANDIDATE RESPONSES ===
+            {candidate_responses}
+        """).strip()
+
+        messages = [
+            {"role": "system", "content": system_content},
+            {"role": "user", "content": user_content},
+        ]
+
+        # 3. Execute and Validate
+        try:
+            resp = self.client.chat(agent["model"], messages)
+            content = self.client.get_content(resp)
+            parsed = json.loads(content)
+
+            vote = parsed.get("vote")
+
+            if vote is None or vote not in other_agent_names:
+                print(f"[!] {agent['name']} produced invalid vote '{vote}'. Ignoring.", file=sys.stderr)
+                return agent["name"], None
+
+            return agent["name"], vote
+
+        except Exception as e:
+            print(f"[!] {agent['name']} deliberation failed (JSON/Ollama error): {e}", file=sys.stderr)
+            return agent["name"], None
+
+    def _run_deliberation_and_voting(
+        self,
+        user_prompt: str,
+        context: str,
+        initial_results: List[AgentResult]
+    ) -> List[AgentResult]:
+        """Orchestrates parallel execution of Stage 2 (Voting)."""
+        print("[*] Stage 2: Agents deliberating and voting...", file=sys.stderr)
+
+        # Format all responses for the deliberation prompt
+        candidate_responses_block = "\n\n" + ("\n\n" + "-" * 60 + "\n\n").join([
+            f"--- Agent: {r.name} ---\n{r.response}" for r in initial_results
+        ])
+
+        deliberation_results = initial_results[:]  # Copy results to update votes
+        result_map = {r.name: r for r in deliberation_results}
+
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            future_to_agent = {
+                executor.submit(
+                    self._run_single_deliberator,
+                    self.agent_defs_by_name[r.name],  # Full agent definition
+                    user_prompt,
+                    context,
+                    candidate_responses_block
+                ): r.name for r in initial_results
+            }
+
+            with tqdm(
+                total=len(future_to_agent),
+                desc="Deliberation",
+                unit="agent",
+                file=sys.stderr,
+                leave=False,
+            ) as pbar:
+                for future in as_completed(future_to_agent):
+                    agent_name = future_to_agent[future]
+                    try:
+                        _, vote = future.result()
+                        # Update the vote in the results list
+                        result_map[agent_name].vote = vote
+                    except Exception as e:
+                        print(f"[!] {agent_name} deliberation crashed: {e}", file=sys.stderr)
+                    finally:
+                        pbar.update(1)
+
+        return deliberation_results
 
     # ---------- Voting & Tie-breaker ----------
 
     def _tally_votes(self, results: List[AgentResult]) -> Dict[str, int]:
-        """
-        Count how many votes each agent received.
-        """
         tally: Dict[str, int] = {}
         for r in results:
             if r.vote is not None:
@@ -441,151 +374,188 @@ class CouncilCoordinator:
 
     @staticmethod
     def _choose_winner_from_tally(tally: Dict[str, int]) -> Tuple[List[str], int]:
-        """
-        Return (winners, max_votes) based on majority vote.
-        """
         if not tally:
             return [], 0
         max_votes = max(tally.values())
         winners = [name for name, count in tally.items() if count == max_votes]
         return winners, max_votes
 
-    def _build_tie_breaker_messages(
+    def _run_tie_breaker(
         self,
         user_prompt: str,
         context: str,
-        tied_results: List[AgentResult],
-    ) -> List[Dict[str, str]]:
-        """
-        Build messages for the tie-breaker judge.
-        """
+        tied_results: List[AgentResult]
+    ) -> Tuple[str, str]:
         candidates_block = []
         for r in tied_results:
-            candidates_block.append(textwrap.dedent(f"""
-                ### Candidate: {r.name}
-                Role: {r.description}
+            agent_def = self.agent_defs_by_name.get(r.name)
+            role_context = agent_def['system_prompt'] if agent_def else "Role context unavailable."
 
-                Response:
-                {r.response}
-            """).strip())
+            # Format the candidate block for the judge
+            candidates_block.append(
+                f"### Candidate: {r.name}\n"
+                f"Role Context: {role_context}\n\n"
+                f"Response:\n{r.response}"
+            )
 
         candidates_joined = "\n\n" + ("\n\n" + "=" * 60 + "\n\n").join(candidates_block)
 
         user_content = textwrap.dedent(f"""
-            The user asked the following question:
-            >>> {user_prompt}
+            The user asked: "{user_prompt}"
 
-            Context from the filebase was used:
-            === FILEBASE CONTEXT START ===
+            Use the context and candidate responses below to select the SINGLE best answer.
+            === CONTEXT ===
             {context}
-            === FILEBASE CONTEXT END ===
-
-            The council of agents has produced multiple candidate answers that are tied by vote.
-            Your job is to select the SINGLE best answer among them.
-
-            --- CANDIDATE RESPONSES (Tied) ---
+            === CANDIDATES ===
             {candidates_joined}
 
-            You MUST respond with a single JSON object with exactly these keys:
-            - "winner": the NAME of the winning agent (string, one of {[r.name for r in tied_results]})
-            - "reasoning": a concise explanation (string) for why you chose this winner.
-
-            Example:
-            {{
-              "winner": "Engineer",
-              "reasoning": "Engineer's answer is more technically correct and comprehensive."
-            }}
+            You MUST respond with a single JSON object: {{"winner": "NAME", "reasoning": "EXPLANATION"}}.
         """).strip()
 
-        return [
+        messages = [
             {
                 "role": "system",
-                "content": "You are an expert, impartial software engineer and tie-breaker.",
+                "content": (
+                    "You are an expert, impartial judge for technical answers. "
+                    "You choose the best answer based on correctness, clarity, and completeness."
+                )
             },
-            {
-                "role": "user",
-                "content": user_content,
-            },
+            {"role": "user", "content": user_content},
         ]
 
-    def _run_tie_breaker_with_progress(
-        self,
-        user_prompt: str,
-        context: str,
-        tied_results: List[AgentResult],
-    ) -> Tuple[str, str]:
-        """
-        Run the tie-breaker model with a small progress bar.
-
-        Returns:
-          (winner_name, reasoning_text)
-        """
-        messages = self._build_tie_breaker_messages(user_prompt, context, tied_results)
-
-        with tqdm(
-            total=1,
-            desc="Tie-breaker",
-            unit="step",
-            file=sys.stderr,
-            leave=False,
-        ) as pbar:
-            resp = self.client.chat(JUDGE_MODEL, messages, json_mode=True)
-            content = self.client.get_content(resp)
-            pbar.update(1)
-
         try:
+            resp = self.client.chat(JUDGE_MODEL, messages)
+            content = self.client.get_content(resp)
             parsed = json.loads(content)
             winner = str(parsed.get("winner", "")).strip()
             reasoning = str(parsed.get("reasoning", "")).strip()
 
-            if not winner:
-                raise ValueError(f"Tie-breaker did not provide 'winner'. Raw JSON: {parsed!r}")
-
             valid_names = {r.name for r in tied_results}
             if winner not in valid_names:
-                raise ValueError(f"Tie-breaker chose invalid winner '{winner}'. Valid: {valid_names}")
+                raise ValueError(f"Judge chose invalid winner '{winner}'.")
 
             return winner, reasoning or "(no reasoning provided)"
 
         except Exception as e:
-            # If judge JSON fails, fall back to "first tied"
-            print(f"[!] Tie-breaker JSON failed: {e}", file=sys.stderr)
+            print(f"[!] Tie-breaker failed: {e}", file=sys.stderr)
             fallback = tied_results[0].name
-            return fallback, f"Fallback to first tied agent due to tie-breaker error: {e}"
+            return fallback, f"Fallback to first tied agent due to error: {e}"
 
-    # ---------- Output Formatting ----------
+    # ---------- Public API and CLI (Refactored Orchestration) ----------
+
+    def ask(self, user_prompt: str, use_rag: bool = False) -> str:
+        """
+        Orchestrates the two-stage process: Response Generation (Stage 1) and 
+        Deliberation & Voting (Stage 2).
+
+        If use_rag is True, we pull context from the local filebase via RAG.
+        If use_rag is False, we do NOT touch the filebase and the models rely
+        only on their own knowledge and personas.
+        """
+        if use_rag:
+            context = self._get_context_with_progress(user_prompt)
+        else:
+            # Explicit stub so it's obvious to the agents that RAG is disabled.
+            context = "No external filebase context. RAG is disabled for this question."
+
+        # --- STAGE 1: Generate Responses ---
+        initial_results = self._run_response_generation(user_prompt, context)
+
+        if not initial_results:
+            return "Error: No agent outputs produced in Stage 1."
+
+        # --- STAGE 2: Deliberate and Vote ---
+        final_results = self._run_deliberation_and_voting(user_prompt, context, initial_results)
+
+        # --- Tallying and Final Winner Selection ---
+        print("[*] Tallying votes...", file=sys.stderr)
+        tally = self._tally_votes(final_results)
+
+        if not tally:
+            print("[!] No valid votes were cast. Returning all responses.\n", file=sys.stderr)
+            return self._format_all_responses(final_results)
+
+        winners, max_votes = self._choose_winner_from_tally(tally)
+        result_by_name = {r.name: r for r in final_results}
+
+        if len(winners) == 1:
+            winner_name = winners[0]
+            winner_result = result_by_name[winner_name]
+            print(f"[+] Winner by majority vote: {winner_name} ({max_votes} votes)", file=sys.stderr)
+            return self._format_majority_winner(winner_name, winner_result)
+        else:
+            print(f"[*] Tie detected ({max_votes} votes each) for: {', '.join(winners)}", file=sys.stderr)
+            print("[*] Running impartial tie-breaker...", file=sys.stderr)
+
+            tied_results = [result_by_name[name] for name in winners]
+            winner_name, reasoning = self._run_tie_breaker(user_prompt, context, tied_results)
+
+            print(f"[+] Tie resolved. Winner: {winner_name}", file=sys.stderr)
+            winning_result = result_by_name.get(winner_name, tied_results[0])
+            return self._format_tie_winner(winner_name, winning_result, reasoning)
+
+    def run_cli(self, argv: Optional[List[str]] = None) -> None:
+        import argparse
+
+        if argv is None:
+            argv = sys.argv[1:]
+
+        parser = argparse.ArgumentParser(
+            prog="council",
+            description="Multi-Agent Council (optionally using local filebase RAG)."
+        )
+
+        # Flag to turn ON RAG-based file context
+        parser.add_argument(
+            "-c", "--context",
+            dest="use_rag",
+            action="store_true",
+            help=(
+                "Use local filebase RAG context (SQLite + embeddings). "
+                "If omitted, no local files will be read."
+            ),
+        )
+
+        parser.add_argument(
+            "prompt",
+            nargs="+",
+            help="Your main question for the council."
+        )
+
+        args = parser.parse_args(argv)
+        user_prompt = " ".join(args.prompt).strip()
+
+        answer = self.ask(user_prompt=user_prompt, use_rag=args.use_rag)
+        print(answer)
+
+    def _get_context_with_progress(self, user_prompt: str) -> str:
+        print("[*] Retrieving filebase context via RAG...", file=sys.stderr)
+        with tqdm(total=1, desc="RAG Context", unit="step", file=sys.stderr, leave=False) as pbar:
+            # NOTE: This calls the external function from rag_helper.py
+            context = get_context(user_prompt)
+            pbar.update(1)
+        return context
 
     @staticmethod
     def _format_all_responses(results: List[AgentResult]) -> str:
-        """
-        Return a combined string of all agent responses.
-        """
-        parts = []
-        for r in results:
-            parts.append(f"--- {r.name} ---\n{r.response}\n")
+        parts = [f"--- {r.name} ---\n{r.response}\n" for r in results]
         return "\n".join(parts).rstrip() + "\n"
 
     @staticmethod
     def _format_majority_winner(name: str, result: AgentResult) -> str:
-        """
-        Format output when a single winner is chosen by majority vote.
-        """
-        header = f"--- WINNER: {name} (Response by Majority Vote) ---\n"
+        header = f"--- WINNER: {name} (Majority Vote) ---\n"
         return header + "\n" + result.response + "\n"
 
     @staticmethod
     def _format_tie_winner(name: str, result: AgentResult, reasoning: str) -> str:
-        """
-        Format output when a tie-breaker was used.
-        """
-        header = f"--- TIE RESOLVED: {name} (Selected by Impartial Tie-Breaker) ---\n"
+        header = f"--- TIE RESOLVED: {name} (Judge Selection) ---\n"
         body = result.response
-        reasoning_block = "\n--- Tie-breaker reasoning ---\n" + reasoning
+        reasoning_block = "\n--- Judge Reasoning ---\n" + reasoning
         return header + "\n" + body + reasoning_block + "\n"
 
 
 # -----------------------------
-# MAIN ENTRYPOINT (Thin CLI)
+# MAIN ENTRYPOINT
 # -----------------------------
 
 def main(argv: Optional[List[str]] = None) -> None:
