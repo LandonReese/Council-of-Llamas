@@ -303,7 +303,12 @@ class CouncilCoordinator:
             vote = parsed.get("vote")
 
             if vote is None or vote not in other_agent_names:
-                print(f"[!] {agent['name']} produced invalid vote '{vote}'. Ignoring.", file=sys.stderr)
+                print(
+                    f"[!] {agent['name']} produced an invalid vote: None / missing.\n"
+                    f"    Reasoning: {reasoning or '(no response provided)'}\n"
+                    f"    Parsed JSON: {parsed!r}",
+                    file=sys.stderr,
+                )
                 return agent["name"], None
 
             return agent["name"], vote

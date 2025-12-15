@@ -1,4 +1,5 @@
 # agents.py (Simplified)
+# Intuitive, Logical, Emotional, Rational, Empathetic, Analytical, Creative, Conjectural, Speculative, Inquisitive, Curious, Reflective, Perceptive, Reasonable, Thoughtful.
 
 # --- CONFIGURATION ---
 JUDGE_MODEL = "llama3:8b"
@@ -6,28 +7,65 @@ JUDGE_MODEL = "llama3:8b"
 # --- AGENT DEFINITIONS ---
 AGENTS = [
     {
-        "name": "Expert 1 (Llama3)",
+        "name": "Aurora",
         "model": "llama3:8b",
-        "system_prompt": "You are a broad generalist expert. Focus on providing clear, foundational, and accessible information.",
+        "system_prompt": "Logical",
     },
     {
-        "name": "Expert 2 (Gemma2)",
+        "name": "Eva",
         "model": "gemma2:9b",
-        "system_prompt": "You are a detailed analyst. Focus on specific insights, deep analysis, and precise reasoning.",
+        "system_prompt": "Rational",
     },
     {
-        "name": "Expert 3 (Deepseek-Coder)",
+        "name": "Rachel",
         "model": "deepseek-coder:6.7b",
-        "system_prompt": "You are a coding and software structure specialist. Focus on code quality and technical implementation details.",
+        "system_prompt": "Analytical",
     },
     {
-        "name": "Expert 4 (Llama3)",
+        "name": "Willow",
         "model": "llama3:8b",
-        "system_prompt": "You are an independent validator and general expert. Focus on fact-checking and providing an alternative, balanced perspective.",
+        "system_prompt": "Speculative",
     },
     {
-        "name": "Expert 5 (Deepseek-Coder)",
-        "model": "deepseek-coder:6.7b",
-        "system_prompt": "You are a code optimization specialist. Focus on code performance, efficiency, and architectural patterns.",
+        "name": "Amanita",
+        "model": "gemma2:9b",
+        "system_prompt": "Creative",
     },
+    {
+        "name": "Raven",
+        "model": "deepseek-coder:6.7b",
+        "system_prompt": "Inquisitive",
+    },
+    {
+        "name": "Emma",
+        "model": "llama3:8b",
+        "system_prompt": "Curious",
+    },
+    {
+        "name": "Harper",
+        "model": "gemma2:9b",
+        "system_prompt": "Reflective",
+    },
+    {
+        "name": "Zoe",
+        "model": "deepseek-coder:6.7b",
+        "system_prompt": "Perceptive",
+    },
+
 ]
+
+#    {
+#        "name": "",
+#        "model": "llama3:8b",
+#        "system_prompt": "",
+#    },
+#    {
+#        "name": "",
+#        "model": "gemma2:9b",
+#        "system_prompt": "",
+#    },
+#    {
+#        "name": "",
+#        "model": "deepseek-coder:6.7b",
+#        "system_prompt": "",
+#    },
