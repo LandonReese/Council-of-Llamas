@@ -1,5 +1,3 @@
-# rag_helper.py
-
 #!/usr/bin/env python3
 """
 rag_helper.py
@@ -10,6 +8,7 @@ RAG helper using:
 """
 
 import os
+import sys
 import json
 import sqlite3
 import textwrap
@@ -19,13 +18,10 @@ import requests
 
 DB_PATH = "./filebase.sqlite"
 EMBED_MODEL = "nomic-embed-text"
-CHAT_MODEL = "llama3" # Not used by RAG directly, but helpful for reference
+CHAT_MODEL = "llama3"
 
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
 
-# -----------------------------
-# EMBEDDINGS
-# -----------------------------
 
 def get_embedding(text: str):
     """Call Ollama embedding API and return a NumPy vector."""
@@ -38,10 +34,6 @@ def get_embedding(text: str):
     data = resp.json()
     return np.array(data["embedding"], dtype=np.float32)
 
-
-# -----------------------------
-# DB ACCESS
-# -----------------------------
 
 def get_connection():
     if not os.path.exists(DB_PATH):
@@ -74,10 +66,6 @@ def load_all_chunks(conn: sqlite3.Connection):
     return chunks
 
 
-# -----------------------------
-# COSINE SIMILARITY
-# -----------------------------
-
 def cosine_similarity(query_vec: np.ndarray, doc_vecs: np.ndarray):
     """Compute cosine similarity."""
     q_norm = np.linalg.norm(query_vec)
@@ -92,14 +80,9 @@ def cosine_similarity(query_vec: np.ndarray, doc_vecs: np.ndarray):
     return sims
 
 
-# -----------------------------
-# RAG RETRIEVAL (k reduced to 3)
-# -----------------------------
-
 def get_context(question: str, k: int = 3) -> str:
     """
     Search the vector DB and return the top-k chunks as a formatted context string.
-    k is reduced to 3 to minimize prompt length and improve agent compliance.
     """
     conn = get_connection()
     chunks = load_all_chunks(conn)

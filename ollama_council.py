@@ -30,23 +30,14 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 from tqdm import tqdm
 
-# NOTE: The user must ensure 'agents.py' and 'rag_helper.py' exist and are correct.
 from agents import AGENTS, JUDGE_MODEL
 from rag_helper import get_context
 
 
-# -----------------------------
-# CONFIGURATION
-# -----------------------------
-
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
-MAX_WORKERS = 5  # Should match the number of agents defined in agents.py
+MAX_WORKERS = 5
 REQUEST_TIMEOUT = 600
 
-
-# -----------------------------
-# AGENT RULES (Two-Stage Prompts)
-# -----------------------------
 
 def get_agent_response_prompt(agent_name: str, agent_sys_prompt: str) -> str:
     """
@@ -93,10 +84,6 @@ def get_agent_deliberation_prompt(agent_name: str, agent_sys_prompt: str, valid_
     """).strip()
 
 
-# -----------------------------
-# DATA MODEL
-# -----------------------------
-
 @dataclass
 class AgentResult:
     """Holds a single agent's result."""
@@ -104,10 +91,6 @@ class AgentResult:
     response: str
     vote: Optional[str]
 
-
-# -----------------------------
-# OLLAMA CLIENT
-# -----------------------------
 
 class OllamaClient:
     """Thin wrapper around Ollama's /api/chat endpoint."""
@@ -119,7 +102,7 @@ class OllamaClient:
         self,
         model: str,
         messages: List[Dict[str, str]],
-        json_mode: bool = True,  # Default to JSON mode for agents
+        json_mode: bool = True,
     ) -> Dict[str, Any]:
         payload: Dict[str, Any] = {
             "model": model,
@@ -145,10 +128,6 @@ class OllamaClient:
             raise ValueError(f"Unexpected response structure: {response!r}")
 
 
-# -----------------------------
-# COUNCIL COORDINATOR
-# -----------------------------
-
 class CouncilCoordinator:
     """High-level orchestrator for the multi-agent council."""
     def __init__(
@@ -161,10 +140,7 @@ class CouncilCoordinator:
         self.agents = agents or AGENTS
         self.max_workers = min(max_workers, len(self.agents)) if self.agents else 1
         self.all_agent_names = [a["name"] for a in self.agents]
-        # Store agent definitions by name for easy lookup
         self.agent_defs_by_name = {a['name']: a for a in self.agents}
-
-    # ---------- Stage 1: Response Generation ----------
 
     def _run_single_response(
         self,
@@ -175,13 +151,11 @@ class CouncilCoordinator:
         """
         Stage 1 Execution: Runs an agent to generate its response (no voting).
         """
-        # 1. Build System Message (Persona + Mandatory Rules - NO VOTE)
         system_content = get_agent_response_prompt(
             agent["name"],
             agent["system_prompt"],
         )
 
-        # 2. Build User Message (Context + Question)
         user_content = textwrap.dedent(f"""
             === FILEBASE CONTEXT START (Top 3 Chunks) ===
             {context}
@@ -199,7 +173,6 @@ class CouncilCoordinator:
             {"role": "user", "content": user_content},
         ]
 
-        # 3. Execute
         try:
             resp = self.client.chat(agent["model"], messages)
             content = self.client.get_content(resp)
@@ -213,7 +186,7 @@ class CouncilCoordinator:
             return AgentResult(
                 name=agent["name"],
                 response=response_text,
-                vote=None,  # Vote is always None in Stage 1
+                vote=None,
             )
 
         except Exception as e:
@@ -251,8 +224,6 @@ class CouncilCoordinator:
                         pbar.update(1)
         return results
 
-    # ---------- Stage 2: Deliberation and Voting ----------
-
     def _run_single_deliberator(
         self,
         agent: Dict[str, Any],
@@ -266,14 +237,12 @@ class CouncilCoordinator:
         """
         other_agent_names = [n for n in self.all_agent_names if n != agent["name"]]
 
-        # 1. Build System Message (Persona + Mandatory Rules - WITH VOTE)
         system_content = get_agent_deliberation_prompt(
             agent["name"],
             agent["system_prompt"],
             other_agent_names,
         )
 
-        # 2. Build User Message (Context + Question + ALL CANDIDATES)
         user_content = textwrap.dedent(f"""
             The original user request: "{user_prompt}"
 
@@ -294,13 +263,13 @@ class CouncilCoordinator:
             {"role": "user", "content": user_content},
         ]
 
-        # 3. Execute and Validate
         try:
             resp = self.client.chat(agent["model"], messages)
             content = self.client.get_content(resp)
             parsed = json.loads(content)
 
             vote = parsed.get("vote")
+            reasoning = parsed.get("reasoning", "")
 
             if vote is None or vote not in other_agent_names:
                 print(
@@ -326,19 +295,18 @@ class CouncilCoordinator:
         """Orchestrates parallel execution of Stage 2 (Voting)."""
         print("[*] Stage 2: Agents deliberating and voting...", file=sys.stderr)
 
-        # Format all responses for the deliberation prompt
         candidate_responses_block = "\n\n" + ("\n\n" + "-" * 60 + "\n\n").join([
             f"--- Agent: {r.name} ---\n{r.response}" for r in initial_results
         ])
 
-        deliberation_results = initial_results[:]  # Copy results to update votes
+        deliberation_results = initial_results[:]
         result_map = {r.name: r for r in deliberation_results}
 
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
             future_to_agent = {
                 executor.submit(
                     self._run_single_deliberator,
-                    self.agent_defs_by_name[r.name],  # Full agent definition
+                    self.agent_defs_by_name[r.name],
                     user_prompt,
                     context,
                     candidate_responses_block
@@ -356,7 +324,6 @@ class CouncilCoordinator:
                     agent_name = future_to_agent[future]
                     try:
                         _, vote = future.result()
-                        # Update the vote in the results list
                         result_map[agent_name].vote = vote
                     except Exception as e:
                         print(f"[!] {agent_name} deliberation crashed: {e}", file=sys.stderr)
@@ -364,8 +331,6 @@ class CouncilCoordinator:
                         pbar.update(1)
 
         return deliberation_results
-
-    # ---------- Voting & Tie-breaker ----------
 
     def _tally_votes(self, results: List[AgentResult]) -> Dict[str, int]:
         tally: Dict[str, int] = {}
@@ -396,7 +361,6 @@ class CouncilCoordinator:
             agent_def = self.agent_defs_by_name.get(r.name)
             role_context = agent_def['system_prompt'] if agent_def else "Role context unavailable."
 
-            # Format the candidate block for the judge
             candidates_block.append(
                 f"### Candidate: {r.name}\n"
                 f"Role Context: {role_context}\n\n"
@@ -446,8 +410,6 @@ class CouncilCoordinator:
             fallback = tied_results[0].name
             return fallback, f"Fallback to first tied agent due to error: {e}"
 
-    # ---------- Public API and CLI (Refactored Orchestration) ----------
-
     def ask(self, user_prompt: str, use_rag: bool = False) -> str:
         """
         Orchestrates the two-stage process: Response Generation (Stage 1) and 
@@ -460,19 +422,15 @@ class CouncilCoordinator:
         if use_rag:
             context = self._get_context_with_progress(user_prompt)
         else:
-            # Explicit stub so it's obvious to the agents that RAG is disabled.
             context = "No external filebase context. RAG is disabled for this question."
 
-        # --- STAGE 1: Generate Responses ---
         initial_results = self._run_response_generation(user_prompt, context)
 
         if not initial_results:
             return "Error: No agent outputs produced in Stage 1."
 
-        # --- STAGE 2: Deliberate and Vote ---
         final_results = self._run_deliberation_and_voting(user_prompt, context, initial_results)
 
-        # --- Tallying and Final Winner Selection ---
         print("[*] Tallying votes...", file=sys.stderr)
         tally = self._tally_votes(final_results)
 
@@ -510,7 +468,6 @@ class CouncilCoordinator:
             description="Multi-Agent Council (optionally using local filebase RAG)."
         )
 
-        # Flag to turn ON RAG-based file context
         parser.add_argument(
             "-c", "--context",
             dest="use_rag",
@@ -536,7 +493,6 @@ class CouncilCoordinator:
     def _get_context_with_progress(self, user_prompt: str) -> str:
         print("[*] Retrieving filebase context via RAG...", file=sys.stderr)
         with tqdm(total=1, desc="RAG Context", unit="step", file=sys.stderr, leave=False) as pbar:
-            # NOTE: This calls the external function from rag_helper.py
             context = get_context(user_prompt)
             pbar.update(1)
         return context
@@ -558,10 +514,6 @@ class CouncilCoordinator:
         reasoning_block = "\n--- Judge Reasoning ---\n" + reasoning
         return header + "\n" + body + reasoning_block + "\n"
 
-
-# -----------------------------
-# MAIN ENTRYPOINT
-# -----------------------------
 
 def main(argv: Optional[List[str]] = None) -> None:
     coordinator = CouncilCoordinator()

@@ -17,41 +17,21 @@ import json
 import requests
 import sqlite3
 
-# -----------------------------
-# CONFIGURATION
-# -----------------------------
-
-# Change this to the directory you want to index
 FILEBASE_DIR = "/home/landon/Documents/Code-Repos/ollama_council"
-
-# SQLite DB path (in project folder)
 DB_PATH = "./filebase.sqlite"
-
-# Embedding model you installed via:
-#   ollama pull nomic-embed-text
 EMBED_MODEL = "nomic-embed-text"
-
-# Ollama server URL
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
 
-# Which file types to index
 ALLOWED_EXTENSIONS = {
     ".py", ".js", ".ts", ".jsx", ".tsx",
     ".md", ".txt", ".json", ".yaml", ".yml",
     ".toml", ".ini", ".cfg", ".sh"
 }
 
-# Chunking config
 MAX_CHARS = 1500
 OVERLAP_CHARS = 200
-
-# How many chunks per transaction
 BATCH_SIZE = 50
 
-
-# -----------------------------
-# HELPERS
-# -----------------------------
 
 def debug(msg: str):
     print(msg, file=sys.stderr)
@@ -115,10 +95,6 @@ def get_embedding(text: str):
     return data["embedding"]
 
 
-# -----------------------------
-# DB SETUP
-# -----------------------------
-
 def init_db(conn: sqlite3.Connection):
     cur = conn.cursor()
     cur.execute(
@@ -128,7 +104,7 @@ def init_db(conn: sqlite3.Connection):
             path TEXT NOT NULL,
             chunk_index INTEGER NOT NULL,
             content TEXT NOT NULL,
-            embedding TEXT NOT NULL -- JSON-encoded list[float]
+            embedding TEXT NOT NULL
         )
         """
     )
@@ -137,14 +113,10 @@ def init_db(conn: sqlite3.Connection):
 
 def clear_db(conn: sqlite3.Connection):
     """Full rebuild each time: wipe all chunks."""
-    cur = conn.cursor    ()
+    cur = conn.cursor()
     cur.execute("DELETE FROM chunks")
     conn.commit()
 
-
-# -----------------------------
-# MAIN
-# -----------------------------
 
 def main():
     if not os.path.isdir(FILEBASE_DIR):
